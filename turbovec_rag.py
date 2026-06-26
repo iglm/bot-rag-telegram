@@ -203,15 +203,17 @@ class SqliteVectorStore:
             raise ImportError("sqlite-vec no instalado. pip install sqlite-vec")
 
         INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        # Limpiar DB corrupta si existe
+        if os.path.exists(self.db_path):
+            os.unlink(self.db_path)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.enable_load_extension(True)
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
 
-        # Crear tabla de vectores
+        # Crear tabla de vectores (rowid es implicita en sqlite-vec)
         self.conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0("
-            f"  chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,"
             f"  text_embedding FLOAT({self.dim})"
             f")"
         )
@@ -246,12 +248,11 @@ class SqliteVectorStore:
         start_id = len(self.metadata)
 
         for i in range(n):
-            emb = embeddings[i].tolist()
-            row_id = start_id + i
-            # Insertar vector
+            emb = embeddings[i].astype(np.float32).tobytes()
+            # Insertar vector como bytes binarios (formato nativo sqlite-vec)
             self.conn.execute(
-                "INSERT INTO vec_chunks(rowid, text_embedding) VALUES (?, ?)",
-                (row_id, emb)
+                "INSERT INTO vec_chunks(text_embedding) VALUES (?)",
+                (emb,)
             )
 
         if metadata_batch:
@@ -275,10 +276,11 @@ class SqliteVectorStore:
         all_indices = []
 
         for q in range(n_queries):
-            # sqlite-vec retorna distancia, no similitud. Convertimos a score.
+            # sqlite-vec necesita array de floats (leer de JSON si es necesario)
+            query_vec = query_embedding[q].astype(np.float32).tobytes()
             cursor = self.conn.execute(
-                "SELECT rowid, distance FROM vec_chunks WHERE text_embedding MATCH ? AND k = ?",
-                (query_vec if q == 0 else query_embedding[q].tolist(), k)
+                "SELECT rowid, distance FROM vec_chunks WHERE text_embedding MATCH ? ORDER BY distance LIMIT ?",
+                (query_vec, k)
             )
             results = cursor.fetchall()
 
