@@ -1,0 +1,7 @@
+aiogram>=3.0
+sentence-transformers>=3.0
+turbovec>=0.8
+pymupdf4llm>=0.1
+ocrmypdf>=17.0
+aiohttp>=3.9
+numpy>=1.24
