@@ -216,21 +216,18 @@ def test_5_deduplication():
     after_first = len(eng.metadata)
     assert after_first == initial_count + count1
 
-    # Simular que el bot agrega hash (no es responsabilidad del engine)
-    if eng.metadata:
-        eng.metadata[-1]["hash"] = hashlib.sha256(open(tp, "rb").read()).hexdigest()
+    # Verificar que el engine indexó correctamente (sin hash, eso es del bot)
+    assert "text" in eng.metadata[-1], "Text field missing after first index"
 
-    # Indexar mismo archivo otra vez
+    # Indexar mismo archivo otra vez (el engine no hace dedup, es esperado)
     count2 = eng.index_file(tp)
     after_second = len(eng.metadata)
-
-    # Verificar que el hash se guardó
-    assert "hash" in eng.metadata[-1], "Hash field not saved"
+    assert after_second == after_first + count2
 
     os.unlink(tp)
     print(f"  ✅ Primera indexación: +{count1} chunks (total: {after_first})")
     print(f"  ✅ Segunda indexación: +{count2} chunks (total: {after_second})")
-    print(f"  ✅ Hash guardado: {eng.metadata[-1]['hash'][:16]}...")
+    print(f"  ✅ Engine indexa sin dedup (correcto, dedup es del bot)")
 
     return True
 
