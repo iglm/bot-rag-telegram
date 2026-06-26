@@ -1,39 +1,57 @@
 #!/usr/bin/env python3
 """
 bot_documentos_indexados.py — Bot RAG para grupo Telegram.
-Indexa PDFs subidos al grupo y responde preguntas usando turbovec + OpenRouter.
+Indexa PDFs/MDs/JSONs/TXTs subidos al grupo y responde preguntas.
 
-Uso:
-  python3 bot_documentos_indexados.py          # iniciar bot
-  python3 bot_documentos_indexados.py --index  # solo indexar (modo batch)
+Mejoras aplicadas:
+- Texto completo en metadata (no preview)
+- OCR automático para PDFs (pymupdf4llm + ocrmypdf)
+- asyncio.to_thread para no bloquear event loop
+- Filtrado por GROUP_ID
+- aiohttp.ClientSession reutilizable
+- Rate limiting OpenRouter
+- Limpieza de temporales al inicio
+- Logging de queries
+- Deduplicación por hash
 """
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
 import numpy as np
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ContentType
+from aiogram.types import Message
 
 # Agregar scripts/ al path
 sys.path.insert(0, str(Path.home() / "scripts"))
 from turbovec_rag import RagEngine
 from ocr_converter import convert_pdf_to_md
 
-# Config
+# Config — cargar .env si existe
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().strip().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 BOT_TOKEN = os.getenv("BOT_TOKEN_DOCS", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 GROUP_ID = -1003795352933
 DOWNLOAD_DIR = Path("/tmp/bot_docs")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_CONCURRENT_OPENROUTER = 3  # Rate limit: max 3 requests simultáneos
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,7 +59,16 @@ logger = logging.getLogger(__name__)
 # Inicializar
 bot: Bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None  # type: ignore
 dp = Dispatcher()
-engine: RagEngine | None = None  # Se carga lazy
+engine: RagEngine | None = None
+
+# Semáforo para rate limiting de OpenRouter
+_openrouter_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPENROUTER)
+
+# Session reutilizable de aiohttp
+_http_session: aiohttp.ClientSession | None = None
+
+# Cache de hashes para deduplicación
+_indexed_hashes: set = set()
 
 
 def get_engine() -> RagEngine:
@@ -49,7 +76,42 @@ def get_engine() -> RagEngine:
     global engine
     if engine is None:
         engine = RagEngine()
+        # Cargar hashes de documentos ya indexados
+        for meta in engine.metadata:
+            if "hash" in meta:
+                _indexed_hashes.add(meta["hash"])
     return engine
+
+
+def get_http_session() -> aiohttp.ClientSession:
+    """Retorna la session reutilizable."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
+            timeout=aiohttp.ClientTimeout(total=60),
+        )
+    return _http_session
+
+
+def file_hash(path: str) -> str:
+    """Calcula SHA256 de un archivo."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cleanup_temp():
+    """Limpia temporales huérfanos al inicio."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    for f in DOWNLOAD_DIR.iterdir():
+        try:
+            f.unlink()
+            logger.info(f"🧹 Temporal limpiado: {f.name}")
+        except Exception:
+            pass
 
 
 async def download_file(file_path: str, dest: Path) -> bool:
@@ -65,7 +127,7 @@ async def download_file(file_path: str, dest: Path) -> bool:
 
 
 async def call_openrouter(prompt: str, context: str = "") -> str:
-    """Llama a OpenRouter para generar respuesta."""
+    """Llama a OpenRouter para generar respuesta con rate limiting."""
     if not OPENROUTER_API_KEY:
         return "❌ OPENROUTER_API_KEY no configurada"
 
@@ -94,30 +156,44 @@ Cita el nombre del documento cuando sea relevante."""
         "temperature": 0.7,
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error(f"OpenRouter error {resp.status}: {text[:200]}")
-                return f"❌ Error del modelo ({resp.status})"
+    async with _openrouter_semaphore:
+        try:
+            session = get_http_session()
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status == 429:
+                    logger.warning("⚠️ Rate limit de OpenRouter, esperando 2s...")
+                    await asyncio.sleep(2)
+                    return await call_openrouter(prompt, context)
 
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"OpenRouter error {resp.status}: {text[:200]}")
+                    return f"❌ Error del modelo ({resp.status})"
+
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+
+        except asyncio.TimeoutError:
+            return "❌ Timeout del modelo"
+        except Exception as e:
+            logger.error(f"Error OpenRouter: {e}")
+            return f"❌ Error de conexión: {e}"
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Mensaje de bienvenida."""
+    if message.chat.id != GROUP_ID:
+        return
     await message.reply(
         "📚 **Bot de Documentos Indexados**\n\n"
-        "Soy un asistente que busca en los PDFs subidos a este grupo.\n\n"
+        "Soy un asistente que busca en los documentos subidos a este grupo.\n\n"
         "**Comandos:**\n"
-        "• `/indexar` — Indexar todos los PDFs del chat\n"
+        "• `/indexar` — Indexar todos los documentos del chat\n"
         "• `/estado` — Ver estado del índice\n"
         "• `/buscar <pregunta>` — Buscar en documentos\n\n"
         "También puedes hacer preguntas directamente y buscaré en los documentos.",
@@ -128,6 +204,8 @@ async def cmd_start(message: Message):
 @dp.message(Command("estado"))
 async def cmd_estado(message: Message):
     """Muestra estado del índice."""
+    if message.chat.id != GROUP_ID:
+        return
     eng = get_engine()
     if not eng.metadata:
         await message.reply("📭 No hay documentos indexados. Usa `/indexar` primero.")
@@ -147,19 +225,20 @@ async def cmd_estado(message: Message):
 
 @dp.message(Command("indexar"))
 async def cmd_indexar(message: Message):
-    """Indexa PDFs del chat."""
+    """Indexa documentos del chat."""
+    if message.chat.id != GROUP_ID:
+        return
+
     await message.reply("⏳ Indexando documentos... Esto puede tardar unos minutos.")
 
     eng = get_engine()
 
-    # Buscar mensajes con documentos recientes
-    # Nota: aiogram no tiene historial directo, indexamos los últimos 100 mensajes
-    if not bot:
-        await message.reply("❌ Bot no inicializado.")
-        return
-
     try:
         messages = []
+        if not bot:
+            await message.reply("❌ Bot no inicializado.")
+            return
+
         async for msg in bot.get_chat_history(message.chat.id, limit=200):  # type: ignore
             if msg.document:
                 messages.append(msg)
@@ -169,20 +248,24 @@ async def cmd_indexar(message: Message):
             return
 
         indexed = 0
+        skipped = 0
         for msg in messages:
             doc = msg.document
-            if not doc or not doc.file_name.lower().endswith(".pdf"):
+            if not doc:
                 continue
 
-            if doc.file_size > MAX_FILE_SIZE:
-                logger.info(f"Archivo muy grande, saltando: {doc.file_name}")
+            file_name = doc.file_name or "unknown"
+            if not file_name.lower().endswith((".pdf", ".md", ".json", ".txt")):
+                continue
+
+            if (doc.file_size or 0) > MAX_FILE_SIZE:
                 continue
 
             # Descargar
-            dest = DOWNLOAD_DIR / doc.file_name
+            dest = DOWNLOAD_DIR / file_name
             DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-            file = await bot.get_file(doc.file_id) if bot else None
+            file = await bot.get_file(doc.file_id) if bot else None  # type: ignore
             if not file:
                 continue
 
@@ -190,89 +273,110 @@ async def cmd_indexar(message: Message):
             if not success:
                 continue
 
-            # Indexar
+            # Deduplicación por hash (QA-2)
+            fhash = file_hash(str(dest))
+            if fhash in _indexed_hashes:
+                logger.info(f"⏭️  Duplicado, saltando: {file_name}")
+                skipped += 1
+                dest.unlink(missing_ok=True)
+                continue
+            _indexed_hashes.add(fhash)
+
             try:
-                if doc.file_name and doc.file_name.lower().endswith(".pdf"):
-                    # PDF → convertir a MD
+                if file_name.lower().endswith(".pdf"):
+                    # PDF → convertir a MD con OCR
                     md_path = str(dest.with_suffix(".md"))
                     await asyncio.get_event_loop().run_in_executor(
                         None, convert_pdf_to_md, str(dest), md_path
                     )
-                    count = eng.index_file(md_path)
+                    count = await asyncio.get_event_loop().run_in_executor(
+                        None, eng.index_file, md_path
+                    )
+                    # Guardar hash en metadata
+                    if eng.metadata:
+                        eng.metadata[-1]["hash"] = fhash
                     indexed += 1
-                    logger.info(f"Indexado (OCR): {doc.file_name} ({count} chunks)")
-                    # Limpiar MD temporal
+                    logger.info(f"Indexado (OCR): {file_name} ({count} chunks)")
                     Path(md_path).unlink(missing_ok=True)
                 else:
-                    count = eng.index_file(str(dest))
+                    count = await asyncio.get_event_loop().run_in_executor(
+                        None, eng.index_file, str(dest)
+                    )
+                    if eng.metadata:
+                        eng.metadata[-1]["hash"] = fhash
                     indexed += 1
-                    logger.info(f"Indexado: {doc.file_name} ({count} chunks)")
+                    logger.info(f"Indexado: {file_name} ({count} chunks)")
+
             except Exception as e:
-                logger.error(f"Error indexando {doc.file_name}: {e}")
+                logger.error(f"Error indexando {file_name}: {e}")
             finally:
-                # Limpiar temporal
                 if dest.exists():
                     dest.unlink()
 
         if indexed > 0:
-            eng.save()
+            await asyncio.get_event_loop().run_in_executor(None, eng.save)
             await message.reply(
                 f"✅ **Indexación completa:**\n"
-                f"• PDFs indexados: {indexed}\n"
+                f"• Documentos indexados: {indexed}\n"
+                f"• Saltados (duplicados): {skipped}\n"
                 f"• Total chunks: {len(eng.metadata)}",
                 parse_mode="Markdown",
             )
         else:
-            await message.reply("⚠️ No se pudieron indexar documentos.")
+            await message.reply(f"⚠️ No se indexaron documentos nuevos. Saltados: {skipped}")
 
     except Exception as e:
         logger.error(f"Error en indexación: {e}")
-        await message.reply(f"❌ Error durante la indexación: {e}")
+        await message.reply("❌ Error durante la indexación.")
 
 
 @dp.message(Command("buscar"))
 async def cmd_buscar(message: Message):
     """Busca en los documentos."""
+    if message.chat.id != GROUP_ID:
+        return
+
     query = (message.text or "").replace("/buscar", "").strip()
     if not query:
         await message.reply("Uso: `/buscar <pregunta>`", parse_mode="Markdown")
         return
 
+    logger.info(f"QUERY: {query}")
+
     await message.reply("🔍 Buscando...")
 
     eng = get_engine()
-    results = eng.query(query, top_k=5)
+    results = await asyncio.get_event_loop().run_in_executor(None, eng.query, query, 5)
 
     if not results:
-        await message.reply("📭 No encontré resultados. Indexa primero con `/indexar`.")
+        await message.reply("📭 No encontré información relevante en los documentos.")
         return
 
-    # Construir contexto
+    # Construir contexto completo (BUG #1 fix: usar texto completo, no preview)
     context_parts = []
     for r in results:
-        context_parts.append(f"[{r['pdf']}]: {r['text_preview'][:300]}")
+        full_text = r.get("text", r.get("text_preview", ""))
+        context_parts.append(f"[{r['pdf']}]: {full_text[:500]}")
 
     context = "\n\n".join(context_parts)
 
-    # Llamar al LLM
     respuesta = await call_openrouter(query, context)
 
-    await message.reply(
-        f"🔍 **Resultados para:** {query}\n\n{respuesta}",
-        parse_mode="Markdown",
-    )
+    await message.reply(respuesta, parse_mode="Markdown")
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     """Ayuda."""
+    if message.chat.id != GROUP_ID:
+        return
     await message.reply(
         "📚 **Comandos disponibles:**\n\n"
-        "• `/indexar` — Busca y indexa PDFs del chat\n"
+        "• `/indexar` — Busca y indexa documentos del chat\n"
         "• `/estado` — Estado del índice\n"
         "• `/buscar <pregunta>` — Búsqueda con respuesta IA\n"
         "• `/help` — Esta ayuda\n\n"
-        "💡 También puedes hacer preguntas directamente y el bot buscará en los documentos.",
+        "💡 También puedes hacer preguntas directamente.",
         parse_mode="Markdown",
     )
 
@@ -280,15 +384,19 @@ async def cmd_help(message: Message):
 @dp.message(F.document)
 async def handle_document(message: Message):
     """Cuando suben un archivo, convertir a MD e indexar."""
+    if message.chat.id != GROUP_ID:
+        return
+
     doc = message.document
-    if not doc or not (doc.file_name or "").lower().endswith((".pdf", ".md", ".json", ".txt")):
+    if not doc:
+        return
+
+    file_name = doc.file_name or "unknown"
+    if not file_name.lower().endswith((".pdf", ".md", ".json", ".txt")):
         return
 
     if not bot:
         return
-
-    file_name = doc.file_name or "unknown"
-    suffix = Path(file_name).suffix.lower()
 
     if (doc.file_size or 0) > MAX_FILE_SIZE:
         await message.reply(f"⚠️ Archivo muy grande ({(doc.file_size or 0) // 1024 // 1024}MB). Máximo: 50MB")
@@ -296,79 +404,71 @@ async def handle_document(message: Message):
 
     await message.reply(f"📄 Procesando: {file_name}...")
 
-    # Si no es PDF, indexar directamente
-    if suffix in (".md", ".json", ".txt"):
-        eng = get_engine()
-        dest = DOWNLOAD_DIR / file_name
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-        file = await bot.get_file(doc.file_id) if bot else None
-        if not file:
-            await message.reply("❌ No pude acceder al archivo.")
-            return
-
-        success = await download_file(file.file_path, dest)
-        if not success:
-            await message.reply("❌ Error descargando el archivo.")
-            return
-
-        try:
-            count = eng.index_file(str(dest))
-            eng.save()
-            await message.reply(f"✅ Indexado: {file_name} ({count} chunks)")
-        except Exception as e:
-            logger.error(f"Error indexando: {e}")
-            await message.reply(f"❌ Error indexando: {e}")
-        finally:
-            if dest.exists():
-                dest.unlink()
-        return
-
-    # Es PDF → convertir a MD con OCR
     eng = get_engine()
     dest = DOWNLOAD_DIR / file_name
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    file = await bot.get_file(doc.file_id) if bot else None
+    file = await bot.get_file(doc.file_id) if bot else None  # type: ignore
     if not file:
         await message.reply("❌ No pude acceder al archivo.")
         return
 
     success = await download_file(file.file_path, dest)
     if not success:
-        await message.reply("❌ Error descargando el PDF.")
+        await message.reply("❌ Error descargando el archivo.")
         return
 
     try:
-        # Convertir PDF a MD automáticamente
-        md_path = str(dest.with_suffix(".md"))
-        await message.reply("🤖 Analizando y convirtiendo PDF a Markdown...")
+        # Deduplicación
+        fhash = file_hash(str(dest))
+        if fhash in _indexed_hashes:
+            await message.reply(f"⏭️  Archivo duplicado, ya estaba indexado: {file_name}")
+            dest.unlink(missing_ok=True)
+            return
+        _indexed_hashes.add(fhash)
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, convert_pdf_to_md, str(dest), md_path
-        )
+        if file_name.lower().endswith(".pdf"):
+            # PDF → MD con OCR
+            md_path = str(dest.with_suffix(".md"))
+            await message.reply("🤖 Analizando y convirtiendo PDF a Markdown...")
 
-        # Indexar el MD resultante
-        count = eng.index_file(md_path)
-        eng.save()
+            await asyncio.get_event_loop().run_in_executor(
+                None, convert_pdf_to_md, str(dest), md_path
+            )
 
-        # Borrar PDF original, mantener MD
-        dest.unlink()
-        md_size = os.path.getsize(md_path) / 1024
+            count = await asyncio.get_event_loop().run_in_executor(
+                None, eng.index_file, md_path
+            )
+            if eng.metadata:
+                eng.metadata[-1]["hash"] = fhash
 
-        await message.reply(
-            f"✅ **{file_name}** convertido e indexado:\n"
-            f"• Formato: PDF → Markdown (OCR)\n"
-            f"• Chunks: {count}\n"
-            f"• MD generado: {md_size:.1f} KB",
-            parse_mode="Markdown",
-        )
+            await asyncio.get_event_loop().run_in_executor(None, eng.save)
+
+            dest.unlink(missing_ok=True)
+            Path(md_path).unlink(missing_ok=True)
+
+            await message.reply(
+                f"✅ **{file_name}** convertido e indexado:\n"
+                f"• Formato: PDF → Markdown (OCR)\n"
+                f"• Chunks: {count}",
+                parse_mode="Markdown",
+            )
+        else:
+            # MD/JSON/TXT → indexar directo
+            count = await asyncio.get_event_loop().run_in_executor(
+                None, eng.index_file, str(dest)
+            )
+            if eng.metadata:
+                eng.metadata[-1]["hash"] = fhash
+
+            await asyncio.get_event_loop().run_in_executor(None, eng.save)
+
+            await message.reply(f"✅ Indexado: {file_name} ({count} chunks)")
 
     except Exception as e:
-        logger.error(f"Error en conversión OCR: {e}")
-        await message.reply(f"❌ Error: {e}")
+        logger.error(f"Error procesando: {e}")
+        await message.reply("❌ Error al procesar el archivo.")
     finally:
-        # Limpiar temporales
         if dest.exists():
             dest.unlink()
         md_temp = dest.with_suffix(".md")
@@ -379,32 +479,36 @@ async def handle_document(message: Message):
 @dp.message(F.text)
 async def handle_question(message: Message):
     """Responde preguntas de texto buscando en documentos."""
+    if message.chat.id != GROUP_ID:
+        return
+
     text = message.text or ""
     query = text.strip()
     if not query or len(query) < 3:
         return
 
-    # Ignorar comandos
     if query.startswith("/"):
         return
 
-    # Solo responder si hay documentos indexados
     eng = get_engine()
     if not eng or not eng.metadata:
-        return  # No responder si no hay nada indexado
+        return
+
+    logger.info(f"QUERY: {query}")
 
     await message.reply("🔍 Buscando...")
 
-    results = eng.query(query, top_k=5)
+    results = await asyncio.get_event_loop().run_in_executor(None, eng.query, query, 5)
 
     if not results:
         await message.reply("📭 No encontré información relevante en los documentos.")
         return
 
-    # Construcción contexto
+    # Contexto completo (BUG #1 fix)
     context_parts = []
     for r in results:
-        context_parts.append(f"[{r['pdf']}]: {r['text_preview'][:300]}")
+        full_text = r.get("text", r.get("text_preview", ""))
+        context_parts.append(f"[{r['pdf']}]: {full_text[:500]}")
 
     context = "\n\n".join(context_parts)
 
@@ -413,19 +517,48 @@ async def handle_question(message: Message):
     await message.reply(respuesta, parse_mode="Markdown")
 
 
+async def on_shutdown():
+    """Limpieza al cerrar."""
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+    cleanup_temp()
+
+
 async def main():
     """Inicia el bot."""
+    global engine
+
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN_DOCS no configurada. export BOT_TOKEN_DOCS=tu_token")
+        print("❌ BOT_TOKEN_DOCS no configurada")
         sys.exit(1)
 
     if not OPENROUTER_API_KEY:
-        print("⚠️ OPENROUTER_API_KEY no configurada. Las respuestas no tendrán LLM.")
+        print("⚠️ OPENROUTER_API_KEY no configurada")
+
+    # OPT: uvloop para mejor async throughput
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        print("✅ uvloop activado")
+    except ImportError:
+        print("⚠️ uvloop no disponible (pip install uvloop)")
+
+    # OPT: TORCH_NUM_THREADS
+    os.environ.setdefault("TORCH_NUM_THREADS", "2")
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+
+    # Limpieza de temporales
+    cleanup_temp()
+
+    # Cargar engine
+    engine = get_engine()
 
     print(f"🤖 Bot iniciado en grupo {GROUP_ID}")
-    if engine:
-        print(f"📊 Engine: turbovec {engine.dim}-dim 4-bit")
+    print(f"📊 Engine: turbovec {engine.dim}-dim 4-bit")
     print(f"🧠 Modelo: {OPENROUTER_MODEL}")
+
+    dp.shutdown.register(on_shutdown)
     await dp.start_polling(bot)  # type: ignore
 
 

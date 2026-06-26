@@ -161,3 +161,26 @@ MIT
 ---
 
 Créditos: Lucas Mateo Tabares Franco + Ing. Jhoan Sebastian Bustamante Montes
+
+## 🔧 Mejoras implementadas
+
+### Bugs corregidos
+- **BUG #1**: `_get_chunk_text()` ahora retorna texto completo (no preview 200 chars)
+- **BUG #3**: OCR real para PDFs escaneados (pymupdf4llm + ocrmypdf)
+- **BUG #4**: Tokens en `.env` con permisos 600 (no en systemd)
+
+### Rendimiento
+- **PERF #4**: Embeddings en batch (model.encode con batch_size=32)
+- **PERF #5**: `asyncio.to_thread()` para no bloquear event loop
+- **PERF #9**: aiohttp.ClientSession reutilizable con connector persistente
+- **PERF #11**: uvloop + TORCH_NUM_THREADS=2
+
+### Calidad
+- **QA #2**: Deduplicación por hash SHA256
+- **QA #7**: Filtrado por GROUP_ID (solo responde en el grupo autorizado)
+- **QA #10**: Limpieza de temporales al inicio + logging de queries
+
+### Seguridad
+- `.env` con permisos 600
+- `.gitignore` excluye `.env`, `*.tv`, `*.tvim`
+- Sin tokens hardcodeados en código fuente

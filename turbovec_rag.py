@@ -157,22 +157,24 @@ class RagEngine:
             return 0
 
         file_name = os.path.basename(file_path)
-        embeddings = []
-        new_metadata = []
 
+        # Batch embeddings (PERF-4): mucho más rápido que uno por uno
+        logger.info(f"Generando {len(chunks)} embeddings en batch...")
+        embeddings = self.model.encode(chunks, normalize_embeddings=True, batch_size=32, show_progress_bar=False)
+        embeddings = embeddings.astype(np.float32)
+
+        new_metadata = []
         for i, chunk in enumerate(chunks):
-            emb = text_to_embedding(chunk, self.model, self.dim)
-            embeddings.append(emb)
             new_metadata.append({
                 "pdf": file_name,
                 "chunk_id": i,
+                "text": chunk,
                 "text_preview": chunk[:200],
-                "chunk_len": len(chunk)
+                "chunk_len": len(chunk),
             })
 
         # Agregar al índice
-        emb_array = np.array(embeddings, dtype=np.float32)
-        self.index.add(emb_array)
+        self.index.add(embeddings)
         self.metadata.extend(new_metadata)
 
         logger.info(f"✅ {len(chunks)} chunks indexados de {file_name}")
@@ -229,7 +231,7 @@ class RagEngine:
     def _get_chunk_text(self, idx: int) -> str:
         """Recupera el texto completo de un chunk por índice."""
         if idx < len(self.metadata):
-            return self.metadata[idx]["text_preview"]
+            return self.metadata[idx].get("text", self.metadata[idx]["text_preview"])
         return ""
 
     def save(self, path: str = None):
