@@ -1,7 +1,29 @@
-aiogram>=3.0
-sentence-transformers>=3.0
-turbovec>=0.8
-pymupdf4llm>=0.1
-ocrmypdf>=17.0
+# Dependencias base del sistema RAG
+turbovec>=0.1.0
+pdfplumber>=0.7.0
+numpy>=1.24.0
+sentence-transformers>=2.2.0
+PyMuPDF>=1.23.0
+pymupdf4llm>=0.1.0
+ocrmypdf>=15.0.0
 aiohttp>=3.9
-numpy>=1.24
+
+# MEJORA 1: Chunking semántico (opcional)
+ai-chunking>=0.1.0
+
+# MEJORA 2: PaddleOCR plugin para OCRmyPDF (opcional)
+ocrmypdf-paddleocr>=0.1.0
+paddlepaddle>=3.0
+paddleocr>=3.0
+
+# MEJORA 3: ONNX Embeddings para inferencia más rápida (opcional)
+onnxruntime>=1.17.0
+optimum[onnxruntime]>=1.20.0
+
+# MEJORA 4: sqlite-vec como almacén vectorial alternativo (opcional)
+sqlite-vec>=0.1.0
+
+# MEJORA 5: docAI pipeline (componentes ya cubiertos arriba)
+
+# MEJORA 6: LightRAG con grafos de conocimiento (opcional)
+lightrag-hku>=1.5.0
