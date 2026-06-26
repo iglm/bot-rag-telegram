@@ -29,6 +29,32 @@ MIN_TEXT_PER_PAGE = 50  # caracteres mínimos por página para considerar digita
 MAX_PAGES_FOR_OCRMYPDF = 100  # OCRmyPDF funciona bien hasta ~100 páginas
 MIN_PAGES_FOR_UNLIMITED_OCR = 50  # Más de 50 páginas → Unlimited-OCR
 
+# --- MEJORA 2: Palabras clave para detectar PDFs en español ---
+SPANISH_KEYWORDS = [
+    "el", "la", "los", "las", "de", "del", "que", "en", "por", "para",
+    "con", "sin", "es", "son", "se", "su", "sus", "entre", "sobre",
+    "este", "esta", "estos", "estas", "como", "más", "pero", "tiene",
+    "una", "uno", "fecha", "total", "código", "nombre", "dirección",
+    "documento", "factura", "informe", "contrato", "certificado",
+    "español", "colombia", "señor", "señora", "gracias", "favor",
+]
+
+# --- MEJORA 1+5: Verificar disponibilidad de parsers alternativos ---
+HAS_MINERU_CHECK = False
+try:
+    import importlib
+    if importlib.util.find_spec("mineru") is not None:
+        HAS_MINERU_CHECK = True
+except Exception:
+    pass
+
+HAS_PDF_OXIDE_CHECK = False
+try:
+    from pdf_oxide import PdfDocument
+    HAS_PDF_OXIDE_CHECK = True
+except ImportError:
+    pass
+
 
 class PDFCAnalyzer:
     """Analiza el contenido de un PDF para clasificarlo."""
@@ -37,6 +63,32 @@ class PDFCAnalyzer:
         self.pdf_path = pdf_path
         self.doc = fitz.open(pdf_path)
         self.stats = self._analyze()
+
+    def _detect_spanish(self, sample_text: str) -> bool:
+        """Detecta si el texto del PDF es principalmente español."""
+        if not sample_text.strip():
+            return False
+        text_lower = sample_text.lower()
+        spanish_count = sum(1 for kw in SPANISH_KEYWORDS if kw in text_lower)
+        # Si encontramos al menos 3 keywords españolas, asumimos español
+        return spanish_count >= 3
+
+    def _detect_tables_or_formulas(self, sample_text: str, stats: dict) -> bool:
+        """Detecta si el PDF contiene tablas, fórmulas o estructura de columnas."""
+        if not sample_text:
+            return False
+        text_lower = sample_text.lower()
+        # Indicadores de tablas
+        table_indicators = ["|", "\t", "columna", "fila", "tabla", "table",
+                           "datos", "valores", "medición", "medicion", "promedio"]
+        # Indicadores de fórmulas matemáticas
+        formula_indicators = ["=", "+", "-", "*", "/", "∑", "∫", "π", "Δ", "θ",
+                             "fórmula", "formula", "ecuación", "ecuacion"]
+        has_tables = any(ind in text_lower for ind in table_indicators)
+        has_formulas = any(ind in text_lower for ind in formula_indicators)
+        # Múltiples columnas detectadas por análisis de layout
+        has_columns = stats.get("avg_text_per_page", 0) > 2000 and stats.get("total_pages", 0) > 5
+        return has_tables or has_formulas or has_columns
 
     def _analyze(self) -> dict:
         """Analiza página por página el PDF."""
@@ -98,13 +150,69 @@ class PDFCAnalyzer:
         pages_without_text = stats["pages_without_text"]
         has_images = stats["pages_with_images"] > 0
 
+        # Obtener muestra de texto para detección de idioma
+        sample_text = ""
+        try:
+            for page_num in range(min(3, total_pages)):
+                sample_text += self.doc[page_num].get_text().strip() + " "
+        except Exception:
+            pass
+
+        is_spanish = self._detect_spanish(sample_text)
+
         # Caso 1: PDF digital (texto seleccionable)
         if text_ratio >= MIN_TEXT_RATIO_DIGITAL and pages_without_text < total_pages * 0.2:
+            # --- MEJORA 1+5: Clasificar sub-tipos de PDFs digitales ---
+            # PDFs con tablas, fórmulas o muchas columnas → MinerU
+            has_tables_or_formulas = self._detect_tables_or_formulas(sample_text, stats)
+            # PDFs bien formados sin estructura compleja → PDF Oxide
+            is_simple_digital = (
+                total_pages <= 50
+                and not has_tables_or_formulas
+                and stats["total_text_chars"] > 1000
+            )
+
+            if has_tables_or_formulas and HAS_MINERU_CHECK:
+                return {
+                    "tool": "pymupdf4llm",
+                    "reason": f"PDF digital complejo (tablas/fórmulas): {stats['pages_with_text']}/{total_pages} páginas con texto",
+                    "confidence": "high",
+                    "stats": stats,
+                    "prefer_paddleocr": False,
+                    "prefer_mineru": True,
+                    "prefer_pdf_oxide": False,
+                }
+            elif is_simple_digital and HAS_PDF_OXIDE_CHECK:
+                return {
+                    "tool": "pymupdf4llm",
+                    "reason": f"PDF digital simple: {stats['pages_with_text']}/{total_pages} páginas con texto",
+                    "confidence": "high",
+                    "stats": stats,
+                    "prefer_paddleocr": False,
+                    "prefer_mineru": False,
+                    "prefer_pdf_oxide": True,
+                }
+            else:
+                return {
+                    "tool": "pymupdf4llm",
+                    "reason": f"PDF digital: {stats['pages_with_text']}/{total_pages} páginas con texto",
+                    "confidence": "high",
+                    "stats": stats,
+                    "prefer_paddleocr": False,
+                    "prefer_mineru": False,
+                    "prefer_pdf_oxide": False,
+                }
+
+        # --- MEJORA 2: Preferir PaddleOCR para PDFs escaneados en español ---
+        if is_spanish and pages_without_text > total_pages * 0.3:
             return {
-                "tool": "pymupdf4llm",
-                "reason": f"PDF digital: {stats['pages_with_text']}/{total_pages} páginas con texto",
+                "tool": "paddleocr",
+                "reason": f"PDF escaneado en español: {pages_without_text}/{total_pages} páginas sin texto",
                 "confidence": "high",
                 "stats": stats,
+                "prefer_paddleocr": True,
+                "prefer_mineru": False,
+                "prefer_pdf_oxide": False,
             }
 
         # Caso 2: PDF escaneado simple (pocas páginas, mayormente imágenes)
@@ -114,6 +222,9 @@ class PDFCAnalyzer:
                 "reason": f"Escaneado simple: {pages_without_text}/{total_pages} páginas sin texto, {total_pages} páginas total",
                 "confidence": "high",
                 "stats": stats,
+                "prefer_paddleocr": is_spanish,
+                "prefer_mineru": False,
+                "prefer_pdf_oxide": False,
             }
 
         # Caso 3: PDF largo/complejo (muchas páginas + escaneado)
@@ -123,6 +234,9 @@ class PDFCAnalyzer:
                 "reason": f"PDF largo: {total_pages} páginas, requiere procesamiento en una pasada",
                 "confidence": "medium",
                 "stats": stats,
+                "prefer_paddleocr": is_spanish,
+                "prefer_mineru": False,
+                "prefer_pdf_oxide": False,
             }
 
         # Caso 4: Contenido mixto (texto + imágenes)
@@ -132,6 +246,9 @@ class PDFCAnalyzer:
                 "reason": f"Contenido mixto: {stats['pages_with_images']} páginas con imágenes + texto",
                 "confidence": "medium",
                 "stats": stats,
+                "prefer_paddleocr": False,
+                "prefer_mineru": False,
+                "prefer_pdf_oxide": False,
             }
 
         # Caso por defecto
@@ -140,6 +257,9 @@ class PDFCAnalyzer:
             "reason": f"Caso general: ratio texto={text_ratio:.2f}, {total_pages} páginas",
             "confidence": "low",
             "stats": stats,
+            "prefer_paddleocr": False,
+            "prefer_mineru": False,
+            "prefer_pdf_oxide": False,
         }
 
     def close(self):

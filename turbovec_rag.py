@@ -47,6 +47,103 @@ except ImportError:
     print("❌ pdfplumber no instalado. Ejecuta: pip install pdfplumber")
     sys.exit(1)
 
+# --- MEJORA 4: GPTCache para cache de embeddings (opcional) ---
+HAS_GPTCACHE = False
+try:
+    from gptcache import cache as gptcache
+    from gptcache.config import Config as GPTConfig
+    from gptcache.manager import manager_factory
+    from gptcache.processor.pre import last_content
+    from gptcache.similarity_evaluation.exact_match import ExactMatchEvaluation
+    import hashlib
+    HAS_GPTCACHE = True
+except ImportError:
+    HAS_GPTCACHE = False
+
+_embedding_cache = None
+_EMBEDDING_CACHE_TTL = int(os.getenv("EMBEDDING_CACHE_TTL", "86400"))  # 24h en segundos
+
+
+def init_embedding_cache() -> bool:
+    """
+    Inicializa el cache de embeddings usando GPTCache.
+    Cachea embeddings por hash SHA256 del texto.
+    TTL por defecto: 24 horas.
+    """
+    global _embedding_cache
+    if not HAS_GPTCACHE:
+        logger.debug("GPTCache no instalado, embeddings sin cache")
+        return False
+
+    try:
+        cache_dir = INDEX_DIR / "gptcache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Inicializar GPTCache con almacenamiento local y coincidencia exacta
+        gptcache.init(
+            config=GPTConfig(
+                similarity_threshold=1.0,  # Exigir coincidencia exacta
+                data_check=True,
+            ),
+            pre_func=last_content,
+            data_manager=manager_factory(
+                manager="local_cache",
+                data_dir=str(cache_dir),
+            ),
+            similarity_evaluation=ExactMatchEvaluation(),
+        )
+
+        _embedding_cache = gptcache
+        logger.info(f"✅ GPTCache inicializado en {cache_dir} (TTL: {_EMBEDDING_CACHE_TTL}s)")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️  GPTCache init falló: {e}")
+        return False
+
+
+def _cached_encode(texts: list[str], encode_fn) -> np.ndarray:
+    """
+    Genera embeddings con cache. Si el texto ya fue embedido,
+    retorna embedding cacheado.
+
+    Args:
+        texts: Lista de textos a embedir
+        encode_fn: Función de encoding (fallback)
+
+    Returns:
+        numpy array con embeddings
+    """
+    if not _embedding_cache or not HAS_GPTCACHE:
+        return encode_fn(texts)
+
+    try:
+        embeddings = []
+        uncached_texts = []
+        uncached_indices = []
+
+        for i, text in enumerate(texts):
+            text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            # Intentar recuperar del cache
+            cached = _embedding_cache.get(text_hash)
+            if cached is not None:
+                embeddings.append(np.frombuffer(cached, dtype=np.float32))
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+
+        if uncached_texts:
+            new_embeddings = encode_fn(uncached_texts)
+            for idx, text, emb in zip(uncached_indices, uncached_texts, new_embeddings):
+                text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                _embedding_cache.set(text_hash, emb.tobytes())
+                embeddings.insert(idx, emb)
+
+        return np.array(embeddings)
+    except Exception as e:
+        logger.warning(f"⚠️  Embedding cache falló ({e}), usando encode directo")
+        return encode_fn(texts)
+
+
 # Config
 DEFAULT_DIM = 1024
 DEFAULT_BIT_WIDTH = 4
@@ -388,11 +485,19 @@ class RagEngine:
         """
         Genera embeddings usando el modelo disponible.
         Prioriza ONNX si está cargado, fallback a sentence-transformers.
+        Usa GPTCache si está inicializado para evitar re-generar embeddings.
         """
-        if self._onnx_model is not None:
-            return _embed_with_onnx(texts, self._onnx_model, self._onnx_tokenizer, self.dim)
-        else:
-            return self.model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False).astype(np.float32)
+        def _encode_inner(t):
+            if self._onnx_model is not None:
+                return _embed_with_onnx(t, self._onnx_model, self._onnx_tokenizer, self.dim)
+            else:
+                return self.model.encode(t, normalize_embeddings=True, batch_size=32, show_progress_bar=False).astype(np.float32)
+
+        # --- MEJORA: GPTCache ---
+        if _embedding_cache is not None and HAS_GPTCACHE:
+            return _cached_encode(texts, _encode_inner)
+
+        return _encode_inner(texts)
 
     def text_to_embedding(self, text: str) -> np.ndarray:
         """Genera embedding para un solo texto."""

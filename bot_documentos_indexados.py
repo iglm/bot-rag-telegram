@@ -36,6 +36,34 @@ sys.path.insert(0, str(Path.home() / "scripts"))
 from turbovec_rag import RagEngine
 from ocr_converter import convert_pdf_to_md
 
+# --- MEJORA 2: LLMRouter (Routing inteligente de modelos) ---
+HAS_LLMROUTER = False
+try:
+    from llm_router import select_model, classify_query
+    HAS_LLMROUTER = True
+except ImportError:
+    HAS_LLMROUTER = False
+
+# --- MEJORA 6: TruLens (Tracking de experimentos) ---
+HAS_TRULENS = False
+try:
+    from trulens.core import TruSession
+    from trulens.core.otel.instrument import instrument
+    HAS_TRULENS = True
+except ImportError:
+    HAS_TRULENS = False
+
+# --- MEJORA 8: Memoria conversacional ---
+HAS_CONVERSATION_MEMORY = False
+try:
+    from conversation_memory import get_memory as get_conversation_memory
+    HAS_CONVERSATION_MEMORY = True
+except ImportError:
+    HAS_CONVERSATION_MEMORY = False
+
+# Archivo de logging para TruLens (si no usa base de datos)
+TRULENS_LOG_FILE = Path.home() / ".hermes" / "trulens_queries.jsonl"
+
 # Config — cargar .env si existe
 _env_file = Path(__file__).parent / ".env"
 if _env_file.exists():
@@ -126,10 +154,35 @@ async def download_file(file_path: str, dest: Path) -> bool:
         return False
 
 
-async def call_openrouter(prompt: str, context: str = "") -> str:
-    """Llama a OpenRouter para generar respuesta con rate limiting."""
+async def call_openrouter(prompt: str, context: str = "", session_id: str = None) -> str:
+    """Llama a OpenRouter para generar respuesta con rate limiting.
+    
+    Args:
+        prompt: Pregunta del usuario
+        context: Contexto de documentos recuperados
+        session_id: ID de sesión para memoria conversacional (opcional)
+    """
     if not OPENROUTER_API_KEY:
         return "❌ OPENROUTER_API_KEY no configurada"
+
+    # --- MEJORA 2: LLMRouter - elegir modelo según tipo de query ---
+    model_to_use = OPENROUTER_MODEL
+    if HAS_LLMROUTER:
+        try:
+            model_to_use = select_model(prompt)
+            logger.debug(f"LLMRouter seleccionó: {model_to_use}")
+        except Exception as e:
+            logger.warning(f"LLMRouter falló ({e}), usando modelo por defecto")
+
+    # --- MEJORA 8: Memoria conversacional ---
+    conversation_context = ""
+    if HAS_CONVERSATION_MEMORY and session_id:
+        try:
+            mem = get_conversation_memory()
+            conversation_context = mem.get_context(session_id, limit=3)
+            logger.debug(f"Contexto conversacional recuperado: {len(conversation_context)} chars")
+        except Exception as e:
+            logger.debug(f"Memoria conversacional no disponible: {e}")
 
     system_prompt = """Eres un asistente útil que responde preguntas basándose SOLO en los documentos proporcionados.
 Si la información no está en los documentos, di que no sabes.
@@ -141,13 +194,17 @@ Cita el nombre del documento cuando sea relevante."""
     else:
         user_content = prompt
 
+    # Si hay contexto conversacional, agregarlo
+    if conversation_context:
+        user_content = f"Historial de conversación:\n{conversation_context}\n\n{user_content}"
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
 
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": model_to_use,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -167,7 +224,7 @@ Cita el nombre del documento cuando sea relevante."""
                 if resp.status == 429:
                     logger.warning("⚠️ Rate limit de OpenRouter, esperando 2s...")
                     await asyncio.sleep(2)
-                    return await call_openrouter(prompt, context)
+                    return await call_openrouter(prompt, context, session_id)
 
                 if resp.status != 200:
                     text = await resp.text()
@@ -175,13 +232,47 @@ Cita el nombre del documento cuando sea relevante."""
                     return f"❌ Error del modelo ({resp.status})"
 
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"]
+                response_text = data["choices"][0]["message"]["content"]
+
+                # --- MEJORA 6: TruLens logging ---
+                _log_query_to_trulens({
+                    "prompt": prompt,
+                    "context": context[:500] if context else "",
+                    "model": model_to_use,
+                    "response": response_text[:500],
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                })
+
+                # --- MEJORA 8: Guardar en memoria conversacional ---
+                if HAS_CONVERSATION_MEMORY and session_id:
+                    try:
+                        mem = get_conversation_memory()
+                        mem.store(session_id, prompt, response_text)
+                    except Exception as e:
+                        logger.debug(f"Error guardando memoria: {e}")
+
+                return response_text
 
         except asyncio.TimeoutError:
             return "❌ Timeout del modelo"
         except Exception as e:
             logger.error(f"Error OpenRouter: {e}")
             return f"❌ Error de conexión: {e}"
+
+
+def _log_query_to_trulens(data: dict):
+    """Guarda datos de query/respuesta para tracking con TruLens.
+    No bloqueante: si falla, el bot sigue funcionando.
+    """
+    if not HAS_TRULENS:
+        return
+    try:
+        TRULENS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(TRULENS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.debug(f"TruLens logging falló: {e}")
 
 
 @dp.message(Command("start"))
@@ -195,7 +286,10 @@ async def cmd_start(message: Message):
         "**Comandos:**\n"
         "• `/indexar` — Indexar todos los documentos del chat\n"
         "• `/estado` — Ver estado del índice\n"
-        "• `/buscar <pregunta>` — Buscar en documentos\n\n"
+        "• `/buscar <pregunta>` — Buscar en documentos\n"
+        "• `/memoria` — Estado de la memoria conversacional\n"
+        "• `/clear_memoria` — Limpiar memoria conversacional\n"
+        "• `/help` — Ayuda\n\n"
         "También puedes hacer preguntas directamente y buscaré en los documentos.",
         parse_mode="Markdown",
     )
@@ -360,7 +454,7 @@ async def cmd_buscar(message: Message):
 
     context = "\n\n".join(context_parts)
 
-    respuesta = await call_openrouter(query, context)
+    respuesta = await call_openrouter(query, context, session_id=str(message.chat.id))
 
     await message.reply(respuesta, parse_mode="Markdown")
 
@@ -375,10 +469,51 @@ async def cmd_help(message: Message):
         "• `/indexar` — Busca y indexa documentos del chat\n"
         "• `/estado` — Estado del índice\n"
         "• `/buscar <pregunta>` — Búsqueda con respuesta IA\n"
+        "• `/memoria` — Estado de la memoria conversacional\n"
+        "• `/clear_memoria` — Limpiar memoria conversacional\n"
         "• `/help` — Esta ayuda\n\n"
         "💡 También puedes hacer preguntas directamente.",
         parse_mode="Markdown",
     )
+
+
+@dp.message(Command("memoria"))
+async def cmd_memoria(message: Message):
+    """Muestra estado de la memoria conversacional."""
+    if message.chat.id != GROUP_ID:
+        return
+    if not HAS_CONVERSATION_MEMORY:
+        await message.reply("💾 Memoria conversacional no disponible (RedisVL no instalado)")
+        return
+    try:
+        mem = get_conversation_memory()
+        stats = mem.stats()
+        await message.reply(
+            f"💾 **Memoria conversacional:**\n"
+            f"• Backend: {stats.get('backend', 'N/A')}\n"
+            f"• Redis disponible: {stats.get('redis_available', False)}\n"
+            f"• Sesiones: {stats.get('total_sessions', 0)}\n"
+            f"• Entradas: {stats.get('total_entries', 0)}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await message.reply(f"❌ Error: {e}")
+
+
+@dp.message(Command("clear_memoria"))
+async def cmd_clear_memoria(message: Message):
+    """Limpia la memoria conversacional de este grupo."""
+    if message.chat.id != GROUP_ID:
+        return
+    if not HAS_CONVERSATION_MEMORY:
+        await message.reply("💾 Memoria conversacional no disponible")
+        return
+    try:
+        mem = get_conversation_memory()
+        mem.clear_session(str(message.chat.id))
+        await message.reply("✅ Memoria conversacional limpiada")
+    except Exception as e:
+        await message.reply(f"❌ Error: {e}")
 
 
 @dp.message(F.document)
@@ -512,7 +647,7 @@ async def handle_question(message: Message):
 
     context = "\n\n".join(context_parts)
 
-    respuesta = await call_openrouter(query, context)
+    respuesta = await call_openrouter(query, context, session_id=str(message.chat.id))
 
     await message.reply(respuesta, parse_mode="Markdown")
 

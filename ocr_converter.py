@@ -30,6 +30,163 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# MEJORA 1: MinerU Parser (PDF→MD rápido para PDFs complejos)
+# =============================================================================
+
+HAS_MINERU = False
+try:
+    # MinerU tiene múltiples puntos de entrada dependiendo de la instalación
+    # Intentar import desde el paquete instalado
+    import importlib
+    _mineru_spec = importlib.util.find_spec("mineru")
+    if _mineru_spec is not None:
+        HAS_MINERU = True
+except Exception:
+    HAS_MINERU = False
+
+
+def convert_with_mineru(pdf_path: str, output_path: str) -> bool:
+    """
+    Convierte PDF a MD usando MinerU.
+    MinerU es un parser de documentos rápido que maneja PDFs complejos
+    (tablas, columnas, fórmulas) significativamente mejor que pymupdf4llm.
+
+    Esta función intenta usar MinerU si está instalado, con fallback
+    a pymupdf4llm si no está disponible o falla.
+
+    Args:
+        pdf_path: Ruta al PDF
+        output_path: Ruta de salida del archivo MD
+
+    Returns:
+        True si tuvo éxito, False en caso contrario
+    """
+    if not HAS_MINERU:
+        logger.warning("⚠️  MinerU no instalado, usando fallback pymupdf4llm")
+        return convert_with_pymupdf4llm(pdf_path, output_path)
+
+    try:
+        logger.info("Convirtiendo con MinerU...")
+
+        # Intentar usar MinerU via API local si está disponible
+        # MinerU se usa normalmente como servidor API (mineru-api)
+        # o mediante import directo de sus módulos
+        # Intentamos primero la importación directa del pipeline
+        import tempfile
+        import subprocess
+
+        # MinerU tiene CLI: mineru [pdf_path] --output_dir [dir]
+        # También se puede usar via el módulo directo
+        output_dir = os.path.dirname(output_path) or tempfile.gettempdir()
+        md_filename = os.path.basename(output_path)
+
+        # Intentar usando el comando mineru si está disponible
+        try:
+            result = subprocess.run(
+                ["mineru", pdf_path, "--output_dir", output_dir],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                # Buscar el archivo MD generado
+                auto_md = Path(output_dir) / md_filename
+                if not auto_md.exists():
+                    # MinerU puede nombrar diferente el output
+                    for f in Path(output_dir).iterdir():
+                        if f.suffix == ".md" and pdf_path in str(f):
+                            auto_md = f
+                            break
+                if auto_md.exists():
+                    os.rename(str(auto_md), output_path)
+                    logger.info(f"✅ MinerU (CLI): {Path(output_path).stat().st_size} bytes")
+                    return True
+            logger.debug(f"MinerU CLI falló: {result.stderr[:200]}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.debug(f"MinerU CLI no disponible: {e}")
+
+        # Fallback: intentar via import directo del pipeline
+        try:
+            from mineru.backend.pipeline.pipeline_analyze import doc_analyze_streaming
+            # MinerU pipeline es complejo de usar directamente
+            # Para este wrapper, intentamos una aproximación más simple
+            logger.debug("MinerU import directo no soportado para conversión simple vía pipeline")
+        except ImportError as e:
+            logger.debug(f"MinerU backend no disponible: {e}")
+
+        # Si llegamos aquí, MinerU no funcionó con ninguno de los métodos
+        logger.warning("⚠️  MinerU no pudo procesar el PDF, usando fallback pymupdf4llm")
+        return convert_with_pymupdf4llm(pdf_path, output_path)
+
+    except Exception as e:
+        logger.error(f"❌ MinerU falló: {e}")
+        logger.info("🔄 Fallback: probando pymupdf4llm...")
+        return convert_with_pymupdf4llm(pdf_path, output_path)
+
+
+# =============================================================================
+# MEJORA 5: PDF Oxide (Parser rápido alternativo)
+# =============================================================================
+
+HAS_PDF_OXIDE = False
+try:
+    from pdf_oxide import PdfDocument
+    HAS_PDF_OXIDE = True
+except ImportError:
+    HAS_PDF_OXIDE = False
+
+
+def convert_with_pdf_oxide(pdf_path: str, output_path: str) -> bool:
+    """
+    Convierte PDF a MD usando PDF Oxide.
+    PDF Oxide es un parser Rust que ofrece 5x más velocidad que PyMuPDF
+    con alta precisión en PDFs bien formados.
+
+    Args:
+        pdf_path: Ruta al PDF
+        output_path: Ruta de salida del archivo MD
+
+    Returns:
+        True si tuvo éxito, False en caso contrario
+    """
+    if not HAS_PDF_OXIDE:
+        logger.warning("⚠️  PDF Oxide no instalado, usando fallback pymupdf4llm")
+        return convert_with_pymupdf4llm(pdf_path, output_path)
+
+    try:
+        logger.info("Convirtiendo con PDF Oxide...")
+
+        doc = PdfDocument(pdf_path)
+        total_pages = doc.page_count()
+
+        md_parts = []
+        for page_num in range(total_pages):
+            try:
+                # Extraer texto plano por página
+                page_text = doc.to_plain_text(page_num)
+                if page_text and page_text.strip():
+                    md_parts.append(f"## Página {page_num + 1}\n\n{page_text}")
+            except Exception as e:
+                logger.debug(f"PDF Oxide page {page_num} falló: {e}")
+                continue
+
+        doc.close()
+
+        if md_parts:
+            md_content = "\n\n".join(md_parts)
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
+            logger.info(f"✅ PDF Oxide: {len(md_content)} chars escritos ({total_pages} páginas)")
+            return True
+        else:
+            logger.warning("⚠️  PDF Oxide no extrajo texto, usando fallback pymupdf4llm")
+            return convert_with_pymupdf4llm(pdf_path, output_path)
+
+    except Exception as e:
+        logger.error(f"❌ PDF Oxide falló: {e}")
+        logger.info("🔄 Fallback: probando pymupdf4llm...")
+        return convert_with_pymupdf4llm(pdf_path, output_path)
+
+
+# =============================================================================
 # MEJORA 2: PaddleOCR plugin para OCRmyPDF
 # =============================================================================
 
@@ -381,7 +538,21 @@ def convert_pdf_to_md(pdf_path: str, output_path: str = None) -> str:
     # Convertir
     success = False
     if tool == "pymupdf4llm":
-        success = convert_with_pymupdf4llm(pdf_path, output_path)
+        # --- MEJORA 1+5: Preferir MinerU o PDF Oxide para PDFs digitales ---
+        if classification.get("prefer_mineru", False):
+            logger.info("⚡ PDF digital complejo — probando MinerU primero...")
+            success = convert_with_mineru(pdf_path, output_path)
+            if not success:
+                logger.info("🔄 Fallback MinerU → pymupdf4llm...")
+                success = convert_with_pymupdf4llm(pdf_path, output_path)
+        elif classification.get("prefer_pdf_oxide", False):
+            logger.info("⚡ PDF simple — probando PDF Oxide primero...")
+            success = convert_with_pdf_oxide(pdf_path, output_path)
+            if not success:
+                logger.info("🔄 Fallback PDF Oxide → pymupdf4llm...")
+                success = convert_with_pymupdf4llm(pdf_path, output_path)
+        else:
+            success = convert_with_pymupdf4llm(pdf_path, output_path)
         if not success:
             logger.info("🔄 Fallback: probando ocrmypdf...")
             success = convert_with_ocrmypdf(pdf_path, output_path)

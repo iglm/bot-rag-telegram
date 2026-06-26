@@ -23,7 +23,23 @@ optimum[onnxruntime]>=1.20.0
 # MEJORA 4: sqlite-vec como almacén vectorial alternativo (opcional)
 sqlite-vec>=0.1.0
 
-# MEJORA 5: docAI pipeline (componentes ya cubiertos arriba)
-
-# MEJORA 6: LightRAG con grafos de conocimiento (opcional)
+# MEJORA 5: LightRAG con grafos de conocimiento (opcional)
 lightrag-hku>=1.5.0
+
+# MEJORA 6: MinerU parser (opcional, alternativa a pymupdf4llm)
+mineru>=3.0.0
+
+# MEJORA 7: PDF Oxide parser rápido (opcional)
+pdf_oxide>=0.3.54
+
+# MEJORA 8: GPTCache (cache de embeddings, opcional)
+gptcache>=0.1.40
+
+# MEJORA 9: RedisVL (memoria conversacional, opcional)
+redisvl>=0.22.0
+
+# MEJORA 10: TruLens (tracking de experimentos, opcional)
+trulens>=2.8.0
+
+# MEJORA 11: open-rag-eval (evaluación RAG, opcional)
+open-rag-eval>=0.1.0

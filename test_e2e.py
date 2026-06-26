@@ -97,6 +97,66 @@ try:
 except ImportError:
     print("⚠️  PaddleOCR no instalado")
 
+# --- MEJORAS 7-8: Nuevas dependencias opcionales ---
+HAS_LLMROUTER = False
+try:
+    from llm_router import select_model, classify_query
+    HAS_LLMROUTER = True
+    print("✅ LLMRouter disponible")
+except ImportError:
+    print("⚠️  LLMRouter no instalado")
+
+HAS_CONVERSATION_MEMORY = False
+try:
+    from conversation_memory import ConversationMemory, get_memory
+    HAS_CONVERSATION_MEMORY = True
+    print("✅ ConversationMemory disponible")
+except ImportError:
+    print("⚠️  ConversationMemory no disponible")
+
+HAS_RAG_EVAL = False
+try:
+    from rag_eval import evaluate_rag, compute_relevance, compute_faithfulness
+    HAS_RAG_EVAL = True
+    print("✅ RAG Eval disponible")
+except ImportError:
+    print("⚠️  RAG Eval no disponible")
+
+HAS_BENCHMARK = False
+try:
+    from benchmark_embeddings import full_benchmark, quick_benchmark
+    HAS_BENCHMARK = True
+    print("✅ Benchmark Embeddings disponible")
+except ImportError:
+    print("⚠️  Benchmark Embeddings no disponible")
+
+HAS_MINERU_CONVERTER = False
+try:
+    from ocr_converter import convert_with_mineru, convert_with_pdf_oxide
+    HAS_MINERU_CONVERTER = True
+    print("✅ MinerU/PDF Oxide converters disponibles")
+except ImportError:
+    print("⚠️  MinerU/PDF Oxide converters no disponibles")
+
+HAS_GPTCACHE_MODULE = False
+try:
+    from turbovec_rag import HAS_GPTCACHE, init_embedding_cache, _cached_encode
+    HAS_GPTCACHE_MODULE = True
+    print("✅ GPTCache disponible en turbovec_rag")
+except ImportError:
+    print("⚠️  GPTCache no disponible en turbovec_rag")
+
+HAS_TRULENS_MODULE = False
+try:
+    from bot_documentos_indexados import HAS_TRULENS, _log_query_to_trulens
+    # TruLens check
+    import importlib
+    if importlib.util.find_spec("trulens") is not None:
+        HAS_TRULENS_MODULE = True
+        print("✅ TruLens disponible")
+except ImportError:
+    print("⚠️  TruLens no disponible")
+
 
 def create_test_pdf(text: str, filename: str = "test.pdf") -> str:
     """Crea un PDF de prueba con el texto dado."""
